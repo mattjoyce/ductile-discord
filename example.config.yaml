@@ -1,0 +1,21 @@
+server:
+  name: "YOUR_SEVER_NAME"
+  id: YOUR_SERVER_ID
+
+bot:
+  token: "YOUR_BOT_TOKEN"
+  prefix: "!"
+  quiet: false  # Can override via CLI --quiet
+
+channels:
+  ## Extract data from image
+  ## post and image, and message "/rowing yyyy-mm-dd"
+  YOUR_CHANNEL_NAME:
+    id: YOUR_CHANNEL_ID
+    cmd_prefix: "/rowing"
+    api_call:
+      url: "https://YOUR_HOST_NAME/api/senechal/rowing/extract"
+      args: {"workout_date": "yyyy-mm-dd"}
+      headers:
+        "Content-Type": "application/json"
+        "X-API-Key": "YOUR_API_KEY"
