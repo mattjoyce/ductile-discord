@@ -17,17 +17,25 @@ import yaml
 
 logger = logging.getLogger("discord")
 logger.setLevel(logging.INFO)
-handler = logging.FileHandler(filename="discord.log", encoding="utf-8", mode="w")
-handler.setFormatter(
-    logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
-)
-logger.addHandler(handler)
-# Stream handler (logs to console)
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(
-    logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
-)
-logger.addHandler(console_handler)
+
+# Setup logging after config is loaded in init
+def setup_logging(config):
+    log_location = getattr(config.bot, "log_location", "./")
+    log_path = f"{log_location.rstrip('/')}/discord.log"
+    
+    # File handler (logs to file)
+    handler = logging.FileHandler(filename=log_path, encoding="utf-8", mode="w")
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
+    )
+    logger.addHandler(handler)
+    
+    # Stream handler (logs to console)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(
+        logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
+    )
+    logger.addHandler(console_handler)
 
 # --- Config Class ---
 
@@ -76,6 +84,9 @@ class SenechalDiscordClient(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents)
         self.config = config
+        
+        # Setup logging with configuration
+        setup_logging(config)
 
     async def on_ready(self):
         """Handle bot ready event by logging successful connection."""
