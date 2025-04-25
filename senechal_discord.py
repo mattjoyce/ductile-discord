@@ -105,7 +105,7 @@ class SenechalDiscordClient(discord.Client):
         if message.author == self.user:
             return
 
-        logger.info("Message from %s: %s", message.author, message.content)
+        logger.info("Message from %s", message.author)
 
         # Identify the channel
         channel_config = None
