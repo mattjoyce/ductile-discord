@@ -17,6 +17,7 @@ import yaml
 
 logger = logging.getLogger("discord")
 logger.setLevel(logging.INFO)
+logger.propagate = False
 
 # Setup logging after config is loaded in init
 def setup_logging(config):
@@ -194,6 +195,11 @@ class SenechalDiscordClient(discord.Client):
                 resp = requests.post(url, json=args, timeout=10)
 
             resp_json = resp.json()
+
+            with open("api_response.json", "w") as f:
+                yaml.dump(resp_json, f, default_flow_style=False, allow_unicode=True)
+            logger.info("API response saved to api_response.json")
+
             logger.info("API response: %s", resp_json)
 
             status = resp_json.get("status", "Error")
