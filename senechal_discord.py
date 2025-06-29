@@ -93,6 +93,12 @@ class SenechalDiscordClient(discord.Client):
         """Handle bot ready event by logging successful connection."""
         if not self.config.bot.quiet:
             print(f"✅ Logged in as {self.user.name}")
+        
+        # Send startup announcement to senechal channel
+        senechal_channel_id = self.config.channels.senechal.id
+        channel = self.get_channel(senechal_channel_id)
+        if channel:
+            await channel.send("🤖 Senechal bot is now online and ready to assist!")
 
     async def on_message(self, message):
         """
@@ -117,6 +123,21 @@ class SenechalDiscordClient(discord.Client):
 
         if not channel_config:
             return  # Message not in a configured channel
+        
+        # Handle /help command for any configured channel
+        if message.content.strip() == "/help":
+            help_message = f"**Available commands in this channel:**\n"
+            
+            for cmd_type, cmd_config in vars(channel_config).items():
+                if cmd_type == "id" or not hasattr(cmd_config, "cmd_prefix"):
+                    continue
+                    
+                cmd_prefix = cmd_config.cmd_prefix
+                help_message += f"• `{cmd_prefix}` - {cmd_type} command\n"
+            
+            help_message += "• `/help` - Show this help message"
+            await message.channel.send(help_message)
+            return
             
         # Look through command types for this channel
         for cmd_type, cmd_config in vars(channel_config).items():
