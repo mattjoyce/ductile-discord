@@ -133,7 +133,8 @@ class SenechalDiscordClient(discord.Client):
                     continue
                     
                 cmd_prefix = cmd_config.cmd_prefix
-                help_message += f"• `{cmd_prefix}` - {cmd_type} command\n"
+                description = getattr(cmd_config, "description", f"{cmd_type} command")
+                help_message += f"• `{cmd_prefix}` - {description}\n"
             
             help_message += "• `/help` - Show this help message"
             await message.channel.send(help_message)
@@ -179,11 +180,32 @@ class SenechalDiscordClient(discord.Client):
                     # Get args structure from config
                     args = vars(cmd_config.api_call.args).copy()
                     
-                    # Find the empty string arg and replace with content
-                    for key, value in args.items():
-                        if value == "":
-                            args[key] = content
+                    # Handle multi-parameter commands
+                    empty_fields = [key for key, value in args.items() if value == ""]
+                    
+                    if len(empty_fields) == 0:
+                        # No empty fields - command doesn't need user input
+                        pass
+                    elif len(empty_fields) == 1:
+                        # Single parameter - use existing behavior
+                        args[empty_fields[0]] = content
+                    elif cmd_type == "llm":
+                        # Special handling for /llm command with prompt and query_url/query_text
+                        await self.handle_llm_command(content, args, cmd_config, message.channel)
+                        break
+                    else:
+                        # Multi-parameter - parse space-separated values
+                        parts = content.split(' ', len(empty_fields) - 1)  # Split into at most len(empty_fields) parts
+                        
+                        if len(parts) != len(empty_fields):
+                            await message.channel.send(f"❌ Expected {len(empty_fields)} parameters: {', '.join(empty_fields)}")
                             break
+                        
+                        # Assign parts to empty fields in order they appear in config
+                        for i, field in enumerate(empty_fields):
+                            args[field] = parts[i]
+                        
+                        logger.info(f"Multi-parameter command parsed: {args}")
                     
                     api_url = cmd_config.api_call.url
                     headers = vars(cmd_config.api_call.headers) if hasattr(cmd_config.api_call, "headers") else {}
@@ -192,6 +214,54 @@ class SenechalDiscordClient(discord.Client):
                 
                 # We found a matching command, stop checking
                 break
+
+    async def handle_llm_command(self, content, args, cmd_config, channel):
+        """
+        Handle the special /llm command with prompt and query_url/query_text parameters.
+        
+        Expected formats:
+        /llm prompt_name https://example.com
+        /llm "custom prompt text" https://example.com
+        /llm prompt_name "some text content"
+        """
+        import shlex
+        
+        try:
+            # Use shlex to properly handle quoted strings
+            parts = shlex.split(content)
+        except ValueError:
+            # If shlex fails (unmatched quotes), fall back to simple split
+            parts = content.split(' ', 1)
+        
+        if len(parts) < 2:
+            await channel.send("❌ /llm command requires 2 parameters: prompt and content\nUsage: `/llm prompt_name url_or_text`")
+            return
+        
+        prompt = parts[0]
+        query_content = parts[1]
+        
+        # Determine if query_content is a URL or text
+        if query_content.startswith(('http://', 'https://')):
+            # It's a URL
+            args["prompt"] = prompt
+            args["query_url"] = query_content
+            # Remove query_text if it exists
+            if "query_text" in args:
+                del args["query_text"]
+        else:
+            # It's text content
+            args["prompt"] = prompt
+            args["query_text"] = query_content
+            # Remove query_url if it exists
+            if "query_url" in args:
+                del args["query_url"]
+        
+        logger.info(f"LLM command parsed - prompt: {prompt}, content: {query_content}")
+        
+        # Make the API call
+        api_url = cmd_config.api_call.url
+        headers = vars(cmd_config.api_call.headers) if hasattr(cmd_config.api_call, "headers") else {}
+        await self.handle_api_call(api_url, args, channel, headers)
 
     async def handle_api_call(self, url, args, channel, headers=None):
         """
