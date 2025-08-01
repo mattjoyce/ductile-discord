@@ -139,7 +139,18 @@ class SenechalDiscordClient(discord.Client):
                     
                 cmd_prefix = cmd_config.cmd_prefix
                 description = getattr(cmd_config, "description", f"{cmd_type} command")
-                help_message += f"• `{cmd_prefix}` - {description}\n"
+                
+                # Add detailed help for LLM command
+                if cmd_type == "llm":
+                    help_message += f"• `{cmd_prefix}` - {description}\n"
+                    help_message += f"  - `{cmd_prefix}` - Show cached prompts\n"
+                    help_message += f"  - `{cmd_prefix} <url>` - Use most recent prompt (!)\n"
+                    help_message += f"  - `{cmd_prefix} ! <url>` - Use cached prompt by symbol\n"
+                    help_message += f"  - `{cmd_prefix} @ \"context\" <url>` - Inject context into cached prompt\n"
+                    help_message += f"  - `{cmd_prefix} \"custom prompt\" <url>` - Create new cached prompt\n"
+                    help_message += f"  - Symbols: `!@#$%^&*()` represent recent prompts\n"
+                else:
+                    help_message += f"• `{cmd_prefix}` - {description}\n"
             
             help_message += "• `/help` - Show this help message"
             await message.channel.send(help_message)
