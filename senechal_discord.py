@@ -6,6 +6,7 @@ based on configuration in a YAML file.
 """
 
 import datetime
+import json
 import logging
 import re
 from types import SimpleNamespace
@@ -85,6 +86,10 @@ class SenechalDiscordClient(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents)
         self.config = config
+        
+        # Initialize prompt cache
+        self.prompt_cache_file = "prompt_cache.json"
+        self.prompt_cache = self.load_prompt_cache()
         
         # Setup logging with configuration
         setup_logging(config)
@@ -217,28 +222,90 @@ class SenechalDiscordClient(discord.Client):
 
     async def handle_llm_command(self, content, args, cmd_config, channel):
         """
-        Handle the special /llm command with prompt and query_url/query_text parameters.
+        Handle the enhanced /llm command with symbol-based prompt caching.
         
         Expected formats:
-        /llm prompt_name https://example.com
-        /llm "custom prompt text" https://example.com
-        /llm prompt_name "some text content"
+        /llm                           # Show cache
+        /llm <url>                     # Use most recent prompt (!) 
+        /llm ! <url>                   # Explicit use of most recent
+        /llm @ "context" <url>         # Use 2nd recent with context
+        /llm "new prompt" <url>        # Create new custom prompt
         """
         import shlex
+        
+        # Handle empty command - show cache
+        if not content.strip():
+            cache_display = self.display_cache()
+            await channel.send(cache_display)
+            return
         
         try:
             # Use shlex to properly handle quoted strings
             parts = shlex.split(content)
         except ValueError:
             # If shlex fails (unmatched quotes), fall back to simple split
-            parts = content.split(' ', 1)
+            parts = content.split()
         
-        if len(parts) < 2:
-            await channel.send("❌ /llm command requires 2 parameters: prompt and content\nUsage: `/llm prompt_name url_or_text`")
+        if len(parts) == 0:
+            # Empty after parsing - show cache
+            cache_display = self.display_cache()
+            await channel.send(cache_display)
             return
         
-        prompt = parts[0]
-        query_content = parts[1]
+        # Check if first part is a URL (default to most recent prompt)
+        if len(parts) == 1 and parts[0].startswith(('http://', 'https://')):
+            # /llm <url> - use most recent prompt
+            most_recent = self.resolve_symbol("!")
+            if not most_recent:
+                await channel.send("❌ No cached prompts available. Use: `/llm \"your prompt\" <url>`")
+                return
+            prompt = most_recent
+            query_content = parts[0]
+            context = None
+        
+        # Check if first part is a symbol
+        elif len(parts) >= 2 and parts[0] in "!@#$%^&*()":
+            symbol = parts[0]
+            cached_prompt = self.resolve_symbol(symbol)
+            if not cached_prompt:
+                await channel.send(f"❌ No prompt cached for symbol `{symbol}`. Use `/llm` to see available prompts.")
+                return
+            
+            # Check if we have context and URL
+            if len(parts) == 3:
+                # /llm @ "context" <url>
+                context = parts[1]
+                query_content = parts[2]
+                prompt = self.inject_context(cached_prompt, context)
+            elif len(parts) == 2:
+                # /llm @ <url>
+                context = None
+                query_content = parts[1]
+                prompt = cached_prompt
+            else:
+                await channel.send(f"❌ Invalid format. Use: `/llm {symbol} [context] <url>`")
+                return
+        
+        # Handle traditional format: prompt + content
+        elif len(parts) >= 2:
+            prompt = parts[0]
+            query_content = parts[1]
+            context = None
+            
+            # Store custom prompt if it's not a predefined one and looks like custom text
+            predefined_prompts = [
+                "extract_learning", "analyze_summary", "analyze_extraction", 
+                "analyze_classification", "rowing_extractor"
+            ]
+            
+            # If prompt is quoted or has spaces, it's likely custom
+            if (prompt not in predefined_prompts and 
+                (len(prompt) > 20 or ' ' in prompt or prompt.startswith('"'))):
+                self.store_custom_prompt(prompt)
+        
+        else:
+            await channel.send("❌ Invalid format. Use: `/llm` (show cache), `/llm <url>` (use recent), or `/llm \"prompt\" <url>`")
+            return
         
         # Determine if query_content is a URL or text
         if query_content.startswith(('http://', 'https://')):
@@ -256,7 +323,7 @@ class SenechalDiscordClient(discord.Client):
             if "query_url" in args:
                 del args["query_url"]
         
-        logger.info(f"LLM command parsed - prompt: {prompt}, content: {query_content}")
+        logger.info(f"LLM command parsed - prompt: {prompt}, content: {query_content}, context: {context}")
         
         # Make the API call
         api_url = cmd_config.api_call.url
@@ -314,6 +381,145 @@ class SenechalDiscordClient(discord.Client):
         except (KeyError, TypeError) as data_error:
             logger.error("Error processing API response: %s", data_error)
             await channel.send(f"❌ Error processing API response: {data_error}")
+
+    def load_prompt_cache(self):
+        """Load prompt cache from JSON file."""
+        try:
+            with open(self.prompt_cache_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            # Return default cache structure
+            return {"prompts": []}
+
+    def save_prompt_cache(self):
+        """Save prompt cache to JSON file."""
+        try:
+            with open(self.prompt_cache_file, 'w', encoding='utf-8') as f:
+                json.dump(self.prompt_cache, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error("Error saving prompt cache: %s", e)
+
+    def store_custom_prompt(self, prompt_text):
+        """
+        Store a custom prompt in the cache with symbol assignment.
+        
+        Args:
+            prompt_text: The custom prompt text to store
+        """
+        # Don't store predefined prompts
+        predefined_prompts = [
+            "extract_learning", "analyze_summary", "analyze_extraction", 
+            "analyze_classification", "rowing_extractor"
+        ]
+        if prompt_text in predefined_prompts:
+            return
+
+        # Don't store if it's already the most recent
+        if (self.prompt_cache["prompts"] and 
+            self.prompt_cache["prompts"][0]["text"] == prompt_text):
+            return
+
+        # Remove existing instance if it exists
+        self.prompt_cache["prompts"] = [
+            p for p in self.prompt_cache["prompts"] if p["text"] != prompt_text
+        ]
+
+        # Add new prompt at the beginning
+        new_prompt = {
+            "text": prompt_text,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "usage_count": 1
+        }
+        self.prompt_cache["prompts"].insert(0, new_prompt)
+
+        # Keep only last 10 prompts
+        self.prompt_cache["prompts"] = self.prompt_cache["prompts"][:10]
+
+        # Assign symbols
+        symbols = "!@#$%^&*()"
+        for i, prompt in enumerate(self.prompt_cache["prompts"]):
+            if i < len(symbols):
+                prompt["symbol"] = symbols[i]
+
+        # Save to file
+        self.save_prompt_cache()
+
+    def resolve_symbol(self, symbol):
+        """
+        Resolve a symbol to prompt text.
+        
+        Args:
+            symbol: The symbol to resolve (!, @, #, etc.)
+            
+        Returns:
+            The prompt text or None if symbol not found
+        """
+        for prompt in self.prompt_cache["prompts"]:
+            if prompt.get("symbol") == symbol:
+                # Update usage count and timestamp
+                prompt["usage_count"] += 1
+                prompt["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                self.save_prompt_cache()
+                return prompt["text"]
+        return None
+
+    def display_cache(self):
+        """
+        Format the prompt cache for Discord display.
+        
+        Returns:
+            Formatted string for Discord message
+        """
+        if not self.prompt_cache["prompts"]:
+            return "**Recent Custom Prompts:** None cached yet."
+
+        lines = ["**Recent Custom Prompts:**"]
+        for prompt in self.prompt_cache["prompts"]:
+            symbol = prompt.get("symbol", "?")
+            text = prompt["text"]
+            # Truncate long prompts
+            if len(text) > 50:
+                text = text[:47] + "..."
+            
+            # Format timestamp
+            try:
+                timestamp = datetime.datetime.fromisoformat(prompt["timestamp"].replace('Z', '+00:00'))
+                time_ago = self.format_time_ago(timestamp)
+            except:
+                time_ago = "unknown"
+            
+            lines.append(f"{symbol} \"{text}\" ({time_ago})")
+
+        return "\n".join(lines)
+
+    def format_time_ago(self, timestamp):
+        """Format timestamp as 'X hours ago' etc."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        diff = now - timestamp
+        
+        if diff.days > 0:
+            return f"{diff.days} day{'s' if diff.days != 1 else ''} ago"
+        elif diff.seconds > 3600:
+            hours = diff.seconds // 3600
+            return f"{hours} hour{'s' if hours != 1 else ''} ago"
+        elif diff.seconds > 60:
+            minutes = diff.seconds // 60
+            return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+        else:
+            return "just now"
+
+    def inject_context(self, prompt, context):
+        """
+        Inject context into a prompt.
+        
+        Args:
+            prompt: The base prompt text
+            context: The context to inject
+            
+        Returns:
+            The prompt with context injected
+        """
+        return f"{prompt} in the context of {context}"
 
 
 # --- CLI Setup with Click ---
