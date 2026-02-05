@@ -175,3 +175,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Runtime / debug artifacts
+api_response.json
+config.yaml.old
+prompt_cache.json
