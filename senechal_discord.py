@@ -193,18 +193,39 @@ class SenechalDiscordClient(discord.Client):
                     content = message.content[len(cmd_prefix):].strip()
                     logger.info(f"Command content: {content}")
                     
-                    # Get args structure from config
-                    args = vars(cmd_config.api_call.args).copy()
-                    
-                    # Handle multi-parameter commands
-                    empty_fields = [key for key, value in args.items() if value == ""]
-                    
+                    # Get args structure from config and convert to plain dicts
+                    args = self.namespace_to_dict(vars(cmd_config.api_call.args))
+
+                    # Recursively find empty fields in nested structures
+                    def find_empty_fields(obj, path=""):
+                        """Find all empty string fields in nested dict/list structures.
+                        Returns list of (path, parent_dict, key) tuples."""
+                        empty = []
+                        if isinstance(obj, dict):
+                            for key, value in obj.items():
+                                current_path = f"{path}.{key}" if path else key
+                                if value == "":
+                                    empty.append((current_path, obj, key))
+                                elif isinstance(value, (dict, list)):
+                                    empty.extend(find_empty_fields(value, current_path))
+                        elif isinstance(obj, list):
+                            for i, value in enumerate(obj):
+                                current_path = f"{path}[{i}]"
+                                if isinstance(value, (dict, list)):
+                                    empty.extend(find_empty_fields(value, current_path))
+                        return empty
+
+                    empty_fields = find_empty_fields(args)
+                    logger.info(f"Found empty fields: {[path for path, _, _ in empty_fields]}")
+
                     if len(empty_fields) == 0:
                         # No empty fields - command doesn't need user input
                         pass
                     elif len(empty_fields) == 1:
-                        # Single parameter - use existing behavior
-                        args[empty_fields[0]] = content
+                        # Single parameter - populate it with message content
+                        path, parent_dict, key = empty_fields[0]
+                        parent_dict[key] = content
+                        logger.info(f"Populated {path} with message content")
                     elif cmd_type == "llm":
                         # Special handling for /llm command with prompt and query_url/query_text
                         await self.handle_llm_command(content, args, cmd_config, message.channel)
@@ -212,15 +233,17 @@ class SenechalDiscordClient(discord.Client):
                     else:
                         # Multi-parameter - parse space-separated values
                         parts = content.split(' ', len(empty_fields) - 1)  # Split into at most len(empty_fields) parts
-                        
+
+                        field_paths = [path for path, _, _ in empty_fields]
                         if len(parts) != len(empty_fields):
-                            await message.channel.send(f"❌ Expected {len(empty_fields)} parameters: {', '.join(empty_fields)}")
+                            await message.channel.send(f"❌ Expected {len(empty_fields)} parameters: {', '.join(field_paths)}")
                             break
-                        
-                        # Assign parts to empty fields in order they appear in config
-                        for i, field in enumerate(empty_fields):
-                            args[field] = parts[i]
-                        
+
+                        # Assign parts to empty fields in order they appear
+                        for i, (path, parent_dict, key) in enumerate(empty_fields):
+                            parent_dict[key] = parts[i]
+                            logger.info(f"Populated {path} = {parts[i]}")
+
                         logger.info(f"Multi-parameter command parsed: {args}")
                     
                     api_url = cmd_config.api_call.url
@@ -341,6 +364,17 @@ class SenechalDiscordClient(discord.Client):
         headers = vars(cmd_config.api_call.headers) if hasattr(cmd_config.api_call, "headers") else {}
         await self.handle_api_call(api_url, args, channel, headers)
 
+    def namespace_to_dict(self, obj):
+        """Recursively convert SimpleNamespace objects to dictionaries."""
+        if isinstance(obj, SimpleNamespace):
+            return {k: self.namespace_to_dict(v) for k, v in vars(obj).items()}
+        elif isinstance(obj, dict):
+            return {k: self.namespace_to_dict(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self.namespace_to_dict(item) for item in obj]
+        else:
+            return obj
+
     async def handle_api_call(self, url, args, channel, headers=None):
         """
         Make an API call and send the formatted response to the Discord channel.
@@ -352,9 +386,8 @@ class SenechalDiscordClient(discord.Client):
             headers: Optional HTTP headers for the request
         """
         try:
-            # Convert args to dictionary if it's a SimpleNamespace
-            if isinstance(args, SimpleNamespace):
-                args = vars(args)
+            # Convert args to dictionary (recursively handle nested SimpleNamespace)
+            args = self.namespace_to_dict(args)
 
             logger.info("Making API call to %s with args: %s", url, args)
             if headers:
