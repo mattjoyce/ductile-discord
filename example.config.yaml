@@ -15,7 +15,7 @@ channels:
     id: YOUR_CHANNEL_ID
     cmd_prefix: "/rowing"
     api_call:
-      url: "https://YOUR_HOST_NAME/api/senechal/rowing/extract"
+      url: "https://YOUR_HOST_NAME/api/ductile/rowing/extract"
       args: {"workout_date": "yyyy-mm-dd"}
       headers:
         "Content-Type": "application/json"

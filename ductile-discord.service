@@ -1,0 +1,15 @@
+[Unit]
+Description=Ductile Discord Bot
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/api/ductile-discord
+ExecStart=/bin/bash -c "source /home/ubuntu/api/ductile-discord/venv/bin/activate && python3 ductile_discord.py --config config.yaml start"
+Restart=always
+Environment="PATH=/home/ubuntu/api/ductile-discord/venv/bin:/usr/bin:/bin"
+StandardOutput=file:/var/log/ductile-discord.log
+StandardError=file:/var/log/ductile-discord-error.log
+
+[Install]
+WantedBy=multi-user.target

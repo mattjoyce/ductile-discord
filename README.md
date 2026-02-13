@@ -1,5 +1,5 @@
-# senechal-discord
-A Discord bot that provides API integration for the Senechal project, featuring advanced prompt caching and meta-prompting capabilities.
+# ductile-discord
+A Discord bot that provides API integration for the Ductile project, featuring advanced prompt caching and meta-prompting capabilities.
 
 ## Features
 

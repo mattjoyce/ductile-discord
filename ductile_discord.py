@@ -1,5 +1,5 @@
 """
-Senechal Discord Bot - A Discord bot for the Senechal project.
+Ductile Discord Bot - A Discord bot for the Ductile project.
 
 This module implements a Discord bot that interacts with API endpoints
 based on configuration in a YAML file.
@@ -72,8 +72,8 @@ class Config(SimpleNamespace):
 # --- Discord Bot ---
 
 
-class SenechalDiscordClient(discord.Client):
-    """Discord client for the Senechal project with API integration."""
+class DuctileDiscordClient(discord.Client):
+    """Discord client for the Ductile project with API integration."""
 
     def __init__(self, config):
         """
@@ -99,11 +99,11 @@ class SenechalDiscordClient(discord.Client):
         if not self.config.bot.quiet:
             print(f"✅ Logged in as {self.user.name}")
         
-        # Send startup announcement to senechal channel
-        senechal_channel_id = self.config.channels.senechal.id
-        channel = self.get_channel(senechal_channel_id)
+        # Send startup announcement to ductile channel
+        ductile_channel_id = self.config.channels.ductile.id
+        channel = self.get_channel(ductile_channel_id)
         if channel:
-            await channel.send("🤖 Senechal bot is now online and ready to assist!")
+            await channel.send("🤖 Ductile bot is now online and ready to assist!")
 
     async def on_message(self, message):
         """
@@ -405,14 +405,37 @@ class SenechalDiscordClient(discord.Client):
             logger.info("API response: %s", resp_json)
 
             status = resp_json.get("status", "Error")
-            message = resp_json.get("message", "No message provided")
-            data = resp_json.get("data")
 
-            reply = f"**{status}:** {message}"
+            # Check for synchronous response format (has "result" field)
+            if "result" in resp_json and resp_json.get("result"):
+                result = resp_json["result"]
 
-            if data:
-                formatted_data = "\n".join(f"- **{k}:** {v}" for k, v in data.items())
-                reply += f"\n{formatted_data}"
+                # Extract fabric output from result.events[0].payload.result
+                if isinstance(result, dict) and "events" in result:
+                    events = result.get("events", [])
+                    if events and isinstance(events, list) and len(events) > 0:
+                        payload = events[0].get("payload", {})
+                        fabric_output = payload.get("result", "")
+
+                        if fabric_output:
+                            # Format the output nicely
+                            reply = f"✅ **{status}**\n\n{fabric_output}"
+                        else:
+                            reply = f"**{status}:** Result received but no output"
+                    else:
+                        reply = f"**{status}:** Result format unexpected"
+                else:
+                    reply = f"**{status}:** {result}"
+            else:
+                # Fallback to old format (message field)
+                message = resp_json.get("message", "No message provided")
+                data = resp_json.get("data")
+
+                reply = f"**{status}:** {message}"
+
+                if data:
+                    formatted_data = "\n".join(f"- **{k}:** {v}" for k, v in data.items())
+                    reply += f"\n{formatted_data}"
 
             await channel.send(reply)
 
@@ -576,7 +599,7 @@ class SenechalDiscordClient(discord.Client):
 )
 @click.pass_context
 def cli(ctx, config, quiet):
-    """Senechal Discord bot CLI interface."""
+    """Ductile Discord bot CLI interface."""
     cfg = Config.load(config)
     if quiet:
         cfg.bot.quiet = quiet
@@ -588,7 +611,7 @@ def cli(ctx, config, quiet):
 def start(ctx):
     """Start the Discord bot."""
     cfg = ctx.obj["cfg"]
-    client = SenechalDiscordClient(cfg)
+    client = DuctileDiscordClient(cfg)
     client.run(cfg.bot.token)
 
 

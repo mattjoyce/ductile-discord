@@ -6,15 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Running the Bot
 ```bash
-python senechal_discord.py start                    # Start with default config.yaml
-python senechal_discord.py --config custom.yaml start   # Start with custom config
-python senechal_discord.py --quiet start               # Start in quiet mode
+python ductile_discord.py start                    # Start with default config.yaml
+python ductile_discord.py --config custom.yaml start   # Start with custom config
+python ductile_discord.py --quiet start               # Start in quiet mode
 ```
 
 ### Health Checks
 ```bash
-python senechal_discord.py check                    # Test all API endpoints
-python senechal_discord.py --config custom.yaml check  # Test with custom config
+python ductile_discord.py check                    # Test all API endpoints
+python ductile_discord.py --config custom.yaml check  # Test with custom config
 ```
 
 ### Dependencies
@@ -27,7 +27,7 @@ pip install discord.py requests pyyaml click
 
 ### Core Components
 
-**Single-File Architecture**: The bot is implemented in `senechal_discord.py` as a monolithic Discord bot with API integration capabilities.
+**Single-File Architecture**: The bot is implemented in `ductile_discord.py` as a monolithic Discord bot with API integration capabilities.
 
 **Configuration-Driven Design**: The bot's behavior is entirely controlled by YAML configuration files that define:
 - Discord channels to monitor
@@ -39,7 +39,7 @@ pip install discord.py requests pyyaml click
 
 **Config**: Loads YAML configuration into nested SimpleNamespace objects for dot notation access.
 
-**SenechalDiscordClient**: Main Discord client that:
+**DuctileDiscordClient**: Main Discord client that:
 - Monitors configured channels for messages
 - Matches message prefixes against configured commands
 - Handles two command types:
