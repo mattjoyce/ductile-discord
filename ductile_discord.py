@@ -444,11 +444,14 @@ class DuctileDiscordClient(discord.Client):
 
         logger.info(f"AI command parsed - payload: {payload}")
 
+        # Send initial "thinking" message
+        thinking_msg = await channel.send("⏳ Processing your request...")
+
         # Make API call
         api_url = cmd_config.api_call.url
         headers = vars(cmd_config.api_call.headers) if hasattr(cmd_config.api_call, "headers") else {}
         args = {"payload": payload}
-        await self.handle_api_call(api_url, args, channel, headers)
+        await self.handle_api_call(api_url, args, channel, headers, status_msg=thinking_msg)
 
     def namespace_to_dict(self, obj):
         """Recursively convert SimpleNamespace objects to dictionaries."""
@@ -461,7 +464,7 @@ class DuctileDiscordClient(discord.Client):
         else:
             return obj
 
-    async def handle_api_call(self, url, args, channel, headers=None):
+    async def handle_api_call(self, url, args, channel, headers=None, status_msg=None):
         """
         Make an API call and send the formatted response to the Discord channel.
 
@@ -470,6 +473,7 @@ class DuctileDiscordClient(discord.Client):
             args: The arguments to send to the API
             channel: The Discord channel to send the response to
             headers: Optional HTTP headers for the request
+            status_msg: Optional message to edit with result (instead of sending new)
         """
         try:
             # Convert args to dictionary (recursively handle nested SimpleNamespace)
@@ -523,17 +527,33 @@ class DuctileDiscordClient(discord.Client):
                     formatted_data = "\n".join(f"- **{k}:** {v}" for k, v in data.items())
                     reply += f"\n{formatted_data}"
 
-            await channel.send(reply)
+            # Edit status message if provided, otherwise send new message
+            if status_msg:
+                await status_msg.edit(content=reply)
+            else:
+                await channel.send(reply)
 
         except requests.RequestException as request_error:
             logger.error("Network error calling API: %s", request_error)
-            await channel.send(f"❌ Network error calling API: {request_error}")
+            error_msg = f"❌ Network error calling API: {request_error}"
+            if status_msg:
+                await status_msg.edit(content=error_msg)
+            else:
+                await channel.send(error_msg)
         except ValueError as value_error:
             logger.error("Invalid response from API: %s", value_error)
-            await channel.send(f"❌ Invalid response from API: {value_error}")
+            error_msg = f"❌ Invalid response from API: {value_error}"
+            if status_msg:
+                await status_msg.edit(content=error_msg)
+            else:
+                await channel.send(error_msg)
         except (KeyError, TypeError) as data_error:
             logger.error("Error processing API response: %s", data_error)
-            await channel.send(f"❌ Error processing API response: {data_error}")
+            error_msg = f"❌ Error processing API response: {data_error}"
+            if status_msg:
+                await status_msg.edit(content=error_msg)
+            else:
+                await channel.send(error_msg)
 
     def load_prompt_cache(self):
         """Load prompt cache from JSON file."""
