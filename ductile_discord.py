@@ -132,26 +132,15 @@ class DuctileDiscordClient(discord.Client):
         # Handle /help command for any configured channel
         if message.content.strip() == "/help":
             help_message = f"**Available commands in this channel:**\n"
-            
+
             for cmd_type, cmd_config in vars(channel_config).items():
                 if cmd_type == "id" or not hasattr(cmd_config, "cmd_prefix"):
                     continue
-                    
+
                 cmd_prefix = cmd_config.cmd_prefix
                 description = getattr(cmd_config, "description", f"{cmd_type} command")
-                
-                # Add detailed help for LLM command
-                if cmd_type == "llm":
-                    help_message += f"• `{cmd_prefix}` - {description}\n"
-                    help_message += f"  - `{cmd_prefix}` - Show cached prompts\n"
-                    help_message += f"  - `{cmd_prefix} <url>` - Use most recent prompt (!)\n"
-                    help_message += f"  - `{cmd_prefix} ! <url>` - Use cached prompt by symbol\n"
-                    help_message += f"  - `{cmd_prefix} @ \"context\" <url>` - Inject context into cached prompt\n"
-                    help_message += f"  - `{cmd_prefix} \"custom prompt\" <url>` - Create new cached prompt\n"
-                    help_message += f"  - Symbols: `!@#$%^&*()` represent recent prompts\n"
-                else:
-                    help_message += f"• `{cmd_prefix}` - {description}\n"
-            
+                help_message += f"• `{cmd_prefix}` - {description}\n"
+
             help_message += "• `/help` - Show this help message"
             await message.channel.send(help_message)
             return
@@ -188,11 +177,17 @@ class DuctileDiscordClient(discord.Client):
                     
                     await self.handle_api_call(api_url, args, message.channel, headers)
                 
+                elif cmd_type == "ai":
+                    # Special handling for /ai command with pattern detection and URL support
+                    content = message.content[len(cmd_prefix):].strip()
+                    logger.info(f"Command content: {content}")
+                    await self.handle_ai_command(content, cmd_config, message.channel)
+
                 else:
                     # Handle text commands
                     content = message.content[len(cmd_prefix):].strip()
                     logger.info(f"Command content: {content}")
-                    
+
                     # Get args structure from config and convert to plain dicts
                     args = self.namespace_to_dict(vars(cmd_config.api_call.args))
 
@@ -362,6 +357,97 @@ class DuctileDiscordClient(discord.Client):
         # Make the API call
         api_url = cmd_config.api_call.url
         headers = vars(cmd_config.api_call.headers) if hasattr(cmd_config.api_call, "headers") else {}
+        await self.handle_api_call(api_url, args, channel, headers)
+
+    async def handle_ai_command(self, content, cmd_config, channel):
+        """
+        Handle the /ai command with smart parsing.
+
+        Formats:
+        /ai "prompt"                    # One-shot question
+        /ai "prompt" "extra text"       # Question with context (concatenated)
+        /ai "prompt" <url>              # Question with URL context
+        /ai "?pattern prompt"           # Use fabric pattern
+        """
+        import shlex
+
+        if not content.strip():
+            await channel.send("❌ Usage: `/ai \"prompt\"` or `/ai \"prompt\" <url>` or `/ai \"?pattern prompt\"`")
+            return
+
+        try:
+            # Use shlex to handle quoted strings properly
+            parts = shlex.split(content)
+        except ValueError:
+            # If shlex fails, fall back to simple split
+            parts = content.split()
+
+        if len(parts) == 0:
+            await channel.send("❌ Please provide a prompt")
+            return
+
+        # Build payload for fabric
+        payload = {}
+        prompt = parts[0]
+        pattern = None
+
+        # Check if first part is a pattern: ?pattern
+        if prompt.startswith("?"):
+            # Extract pattern
+            if " " in prompt:
+                # Pattern and text in same quoted string: "?analyze some text"
+                pattern_name, prompt_rest = prompt[1:].split(" ", 1)
+                pattern = pattern_name
+                prompt = prompt_rest
+            elif len(parts) > 1:
+                # Pattern as separate word: ?analyze "text" or ?analyze url
+                pattern = prompt[1:]  # Remove the ?
+                prompt = parts[1]  # Use second part as prompt
+                parts = [prompt] + parts[2:]  # Rebuild parts without the pattern
+            else:
+                # Just ?pattern with no text - error
+                await channel.send("❌ Pattern format: `/ai ?pattern \"prompt\"` or `/ai ?pattern url`")
+                return
+
+        # Check for additional parameters
+        if len(parts) == 1:
+            # One-shot: /ai "prompt"
+            payload["prompt"] = prompt
+            if pattern:
+                payload["pattern"] = pattern
+
+        elif len(parts) == 2:
+            # Two parameters: either "prompt" "text" or "prompt" <url>
+            second_param = parts[1]
+
+            # Check if second parameter is a URL
+            if second_param.startswith(("http://", "https://")):
+                # URL mode
+                if "youtube.com" in second_param or "youtu.be" in second_param:
+                    payload["prompt"] = prompt
+                    payload["youtube_url"] = second_param
+                else:
+                    payload["prompt"] = prompt
+                    payload["url"] = second_param
+
+                if pattern:
+                    payload["pattern"] = pattern
+            else:
+                # Text context mode - concatenate
+                payload["prompt"] = f"{prompt}\n\n{second_param}"
+                if pattern:
+                    payload["pattern"] = pattern
+
+        else:
+            await channel.send("❌ Too many parameters. Usage: `/ai \"prompt\"` or `/ai \"prompt\" <url>`")
+            return
+
+        logger.info(f"AI command parsed - payload: {payload}")
+
+        # Make API call
+        api_url = cmd_config.api_call.url
+        headers = vars(cmd_config.api_call.headers) if hasattr(cmd_config.api_call, "headers") else {}
+        args = {"payload": payload}
         await self.handle_api_call(api_url, args, channel, headers)
 
     def namespace_to_dict(self, obj):
