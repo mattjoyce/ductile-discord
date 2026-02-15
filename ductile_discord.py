@@ -409,34 +409,45 @@ class DuctileDiscordClient(discord.Client):
                 await channel.send("❌ Pattern format: `/ai ?pattern \"prompt\"` or `/ai ?pattern url`")
                 return
 
+        # Helper to classify a string as URL type
+        def classify_url(s):
+            if not s.startswith(("http://", "https://")):
+                return None
+            if "youtube.com" in s or "youtu.be" in s:
+                return "youtube"
+            return "url"
+
         # Check for additional parameters
         if len(parts) == 1:
-            # One-shot: /ai "prompt"
-            payload["prompt"] = prompt
+            url_type = classify_url(prompt)
+            if url_type == "youtube":
+                # URL-only: /ai ?pattern <youtube_url>
+                payload["youtube_url"] = prompt
+            elif url_type == "url":
+                # URL-only: /ai ?pattern <url>
+                payload["url"] = prompt
+            else:
+                # One-shot: /ai "prompt"
+                payload["prompt"] = prompt
             if pattern:
                 payload["pattern"] = pattern
 
         elif len(parts) == 2:
-            # Two parameters: either "prompt" "text" or "prompt" <url>
             second_param = parts[1]
+            url_type = classify_url(second_param)
 
-            # Check if second parameter is a URL
-            if second_param.startswith(("http://", "https://")):
-                # URL mode
-                if "youtube.com" in second_param or "youtu.be" in second_param:
-                    payload["prompt"] = prompt
-                    payload["youtube_url"] = second_param
-                else:
-                    payload["prompt"] = prompt
-                    payload["url"] = second_param
-
-                if pattern:
-                    payload["pattern"] = pattern
+            if url_type == "youtube":
+                payload["prompt"] = prompt
+                payload["youtube_url"] = second_param
+            elif url_type == "url":
+                payload["prompt"] = prompt
+                payload["url"] = second_param
             else:
                 # Text context mode - concatenate
                 payload["prompt"] = f"{prompt}\n\n{second_param}"
-                if pattern:
-                    payload["pattern"] = pattern
+
+            if pattern:
+                payload["pattern"] = pattern
 
         else:
             await channel.send("❌ Too many parameters. Usage: `/ai \"prompt\"` or `/ai \"prompt\" <url>`")
@@ -447,10 +458,20 @@ class DuctileDiscordClient(discord.Client):
         # Send initial "thinking" message
         thinking_msg = await channel.send("⏳ Processing your request...")
 
-        # Make API call
-        api_url = cmd_config.api_call.url
+        # Route to the correct pipeline based on input type
+        base_url = cmd_config.api_call.url.rsplit("/trigger/", 1)[0]
+        if "youtube_url" in payload:
+            api_url = f"{base_url}/trigger/youtube_transcript/handle"
+            # Rename youtube_url to url for the youtube_transcript plugin
+            payload["url"] = payload.pop("youtube_url")
+        elif "url" in payload:
+            api_url = f"{base_url}/trigger/jina-reader/handle"
+        else:
+            api_url = cmd_config.api_call.url  # default: fabric/handle
+
         headers = vars(cmd_config.api_call.headers) if hasattr(cmd_config.api_call, "headers") else {}
         args = {"payload": payload}
+        logger.info(f"AI routing to: {api_url}")
         await self.handle_api_call(api_url, args, channel, headers, status_msg=thinking_msg)
 
     def namespace_to_dict(self, obj):
@@ -498,24 +519,21 @@ class DuctileDiscordClient(discord.Client):
 
             # Check for synchronous response format (has "result" field)
             if "result" in resp_json and resp_json.get("result"):
+                fabric_output = ""
+
+                # The API now returns the terminal step result directly in the top-level "result" field
                 result = resp_json["result"]
-
-                # Extract fabric output from result.events[0].payload.result
                 if isinstance(result, dict) and "events" in result:
-                    events = result.get("events", [])
-                    if events and isinstance(events, list) and len(events) > 0:
-                        payload = events[0].get("payload", {})
-                        fabric_output = payload.get("result", "")
+                    for ev in result.get("events", []):
+                        r = ev.get("payload", {}).get("result", "")
+                        if r:
+                            fabric_output = r
+                            break
 
-                        if fabric_output:
-                            # Format the output nicely
-                            reply = f"✅ **{status}**\n\n{fabric_output}"
-                        else:
-                            reply = f"**{status}:** Result received but no output"
-                    else:
-                        reply = f"**{status}:** Result format unexpected"
+                if fabric_output:
+                    reply = f"✅ **{status}**\n\n{fabric_output}"
                 else:
-                    reply = f"**{status}:** {result}"
+                    reply = f"**{status}:** Result received but no output"
             else:
                 # Fallback to old format (message field)
                 message = resp_json.get("message", "No message provided")
