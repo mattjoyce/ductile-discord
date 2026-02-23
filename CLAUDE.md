@@ -6,21 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Running the Bot
 ```bash
-python ductile_discord.py start                    # Start with default config.yaml
-python ductile_discord.py --config custom.yaml start   # Start with custom config
-python ductile_discord.py --quiet start               # Start in quiet mode
+uv run ductile-discord start                          # Start with default config.yaml
+uv run ductile-discord --config custom.yaml start     # Start with custom config
+uv run ductile-discord --quiet start                  # Start in quiet mode
 ```
 
 ### Health Checks
 ```bash
-python ductile_discord.py check                    # Test all API endpoints
-python ductile_discord.py --config custom.yaml check  # Test with custom config
+uv run ductile-discord check                          # Test all API endpoints
+uv run ductile-discord --config custom.yaml check     # Test with custom config
 ```
 
 ### Dependencies
-No package management files found. Install dependencies manually:
+Sync project dependencies:
 ```bash
-pip install discord.py requests pyyaml click
+uv sync
 ```
 
 ## Architecture Overview
@@ -86,7 +86,7 @@ channels:
 
 ## Important Notes
 
-- No dependency management files - dependencies must be installed manually
+- Dependency management is handled by `uv` (`pyproject.toml` + `uv.lock`)
 - Configuration contains sensitive tokens and API keys
 - Bot requires `message_content` intent to read message text
 - API calls have different timeout values (10s default, 120s for rowing endpoints)

@@ -1,0 +1,19 @@
+[project]
+name = "ductile-discord"
+version = "0.1.0"
+description = "Discord bot for the Ductile project."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1.0",
+    "discord.py>=2.4.0",
+    "requests>=2.31.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.scripts]
+ductile-discord = "ductile_discord:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -521,14 +521,30 @@ class DuctileDiscordClient(discord.Client):
             if "result" in resp_json and resp_json.get("result"):
                 fabric_output = ""
 
-                # The API now returns the terminal step result directly in the top-level "result" field
+                # Prefer the top-level terminal result when present, with compatibility
+                # fallback for older event-based response shapes.
                 result = resp_json["result"]
-                if isinstance(result, dict) and "events" in result:
-                    for ev in result.get("events", []):
-                        r = ev.get("payload", {}).get("result", "")
-                        if r:
-                            fabric_output = r
-                            break
+
+                if isinstance(result, str):
+                    fabric_output = result
+                elif isinstance(result, dict):
+                    direct_result = result.get("result")
+                    if isinstance(direct_result, str) and direct_result:
+                        fabric_output = direct_result
+
+                    if not fabric_output and "events" in result:
+                        for ev in result.get("events", []):
+                            if not isinstance(ev, dict):
+                                continue
+                            payload = ev.get("payload", {})
+                            if not isinstance(payload, dict):
+                                continue
+                            event_result = payload.get("result", "")
+                            if event_result:
+                                fabric_output = event_result
+                                break
+                elif result is not None:
+                    fabric_output = str(result)
 
                 if fabric_output:
                     reply = f"✅ **{status}**\n\n{fabric_output}"

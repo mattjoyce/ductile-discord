@@ -1,6 +1,20 @@
 # ductile-discord
 A Discord bot that provides API integration for the Ductile project, featuring advanced prompt caching and meta-prompting capabilities.
 
+## Setup (uv)
+
+```bash
+uv sync
+```
+
+## Run
+
+```bash
+uv run ductile-discord start
+uv run ductile-discord --config custom.yaml start
+uv run ductile-discord check
+```
+
 ## Features
 
 ### Core Functionality
