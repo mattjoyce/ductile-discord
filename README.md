@@ -58,3 +58,6 @@ uv run ductile-discord check
 ## Configuration
 
 See `CLAUDE.md` for detailed configuration instructions and architecture overview.
+
+## Changelog
+See [CHANGELOG.md](CHANGELOG.md).
