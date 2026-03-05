@@ -1,745 +1,604 @@
 """
-Ductile Discord Bot - A Discord bot for the Ductile project.
+Ductile Discord Bot
 
-This module implements a Discord bot that interacts with API endpoints
-based on configuration in a YAML file.
+Slash commands (/llm, /status, /help) + @mention → AgenticLoop.
 """
 
+import asyncio
 import datetime
+import io
 import json
 import logging
-import re
+import os
 from types import SimpleNamespace
 
+import aiohttp
 import click
 import discord
-import requests
+from discord import app_commands
 import yaml
 
-logger = logging.getLogger("discord")
-logger.setLevel(logging.INFO)
-logger.propagate = False
+logger = logging.getLogger("ductile_discord")
 
-# Setup logging after config is loaded in init
-def setup_logging(config):
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def setup_logging(config) -> None:
     log_location = getattr(config.bot, "log_location", "./")
     log_path = f"{log_location.rstrip('/')}/discord.log"
-    
-    # File handler (logs to file)
-    handler = logging.FileHandler(filename=log_path, encoding="utf-8", mode="w")
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
-    )
-    logger.addHandler(handler)
-    
-    # Stream handler (logs to console)
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(
-        logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
-    )
-    logger.addHandler(console_handler)
+    fmt = logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
 
-# --- Config Class ---
+    fh = logging.FileHandler(filename=log_path, encoding="utf-8", mode="a")
+    fh.setFormatter(fmt)
+
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+
+    logger.setLevel(logging.INFO)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def load_dotenv(path: str) -> None:
+    config_dir = os.path.dirname(os.path.abspath(path))
+    env_path = os.path.join(config_dir, ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def _interpolate(obj):
+    """Recursively expand ${VAR} in strings."""
+    if isinstance(obj, dict):
+        return {k: _interpolate(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_interpolate(v) for v in obj]
+    if isinstance(obj, str):
+        return os.path.expandvars(obj)
+    return obj
 
 
 class Config(SimpleNamespace):
-    """Configuration class that loads YAML into a hierarchical namespace."""
-
     @staticmethod
     def load(path: str):
-        """
-        Load YAML configuration file into a namespace.
-
-        Args:
-            path: Path to the YAML configuration file
-
-        Returns:
-            A SimpleNamespace object with the configuration data
-        """
-
-        def to_namespace(data):
+        def to_ns(data):
             if isinstance(data, dict):
-                return SimpleNamespace(**{k: to_namespace(v) for k, v in data.items()})
+                return SimpleNamespace(**{k: to_ns(v) for k, v in data.items()})
             if isinstance(data, list):
-                return [to_namespace(i) for i in data]
+                return [to_ns(i) for i in data]
             return data
 
-        with open(path, encoding="utf-8") as config_file:
-            data = yaml.safe_load(config_file)
-        return to_namespace(data)
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return to_ns(data)
 
 
-# --- Discord Bot ---
+# ---------------------------------------------------------------------------
+# Prompt Cache
+# ---------------------------------------------------------------------------
+
+SYMBOLS = "!@#$%^&*()"
 
 
-class DuctileDiscordClient(discord.Client):
-    """Discord client for the Ductile project with API integration."""
+class PromptCache:
+    def __init__(self, cache_file: str = "prompt_cache.json"):
+        self.cache_file = cache_file
+        self.prompts: list[dict] = self._load()
 
+    def _load(self) -> list:
+        try:
+            with open(self.cache_file, encoding="utf-8") as f:
+                return json.load(f).get("prompts", [])
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+    def _save(self) -> None:
+        try:
+            with open(self.cache_file, "w", encoding="utf-8") as f:
+                json.dump({"prompts": self.prompts}, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error("Failed to save prompt cache: %s", e)
+
+    def _assign_symbols(self) -> None:
+        for i, p in enumerate(self.prompts):
+            p["symbol"] = SYMBOLS[i] if i < len(SYMBOLS) else "?"
+
+    def store(self, text: str) -> str:
+        """Store a prompt. Returns the symbol it was assigned."""
+        text = text.strip()
+        if not text:
+            return ""
+        # Already most recent — just return its symbol
+        if self.prompts and self.prompts[0]["text"] == text:
+            return self.prompts[0].get("symbol", "!")
+        # Remove existing entry
+        self.prompts = [p for p in self.prompts if p["text"] != text]
+        self.prompts.insert(0, {
+            "text": text,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "usage_count": 1,
+        })
+        self.prompts = self.prompts[:10]
+        self._assign_symbols()
+        self._save()
+        return self.prompts[0].get("symbol", "!")
+
+    def resolve(self, symbol: str) -> str | None:
+        """Resolve a symbol to prompt text, updating usage stats."""
+        for p in self.prompts:
+            if p.get("symbol") == symbol:
+                p["usage_count"] = p.get("usage_count", 0) + 1
+                p["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                self._save()
+                return p["text"]
+        return None
+
+    def format_for_discord(self) -> str:
+        if not self.prompts:
+            return "**Prompt cache:** empty"
+        lines = ["**Prompt cache:**"]
+        for p in self.prompts:
+            sym = p.get("symbol", "?")
+            text = p["text"]
+            if len(text) > 60:
+                text = text[:57] + "…"
+            lines.append(f"`{sym}` {text}")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# AgenticLoop client
+# ---------------------------------------------------------------------------
+
+class AgenticLoopClient:
+    def __init__(self, base_url: str, token: str):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+
+    @property
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+
+    async def wake(
+        self,
+        session: aiohttp.ClientSession,
+        goal: str,
+        wake_id: str,
+        context: dict | None = None,
+    ) -> dict:
+        payload = {"wake_id": wake_id, "goal": goal, "context": context or {}}
+        async with session.post(
+            f"{self.base_url}/v1/wake",
+            json=payload,
+            headers=self._headers,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+    async def poll_until_done(
+        self,
+        session: aiohttp.ClientSession,
+        run_id: str,
+        timeout: int = 120,
+    ) -> dict:
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        intervals = [1, 2, 4, 5, 5, 5, 5, 5, 5, 5]
+        idx = 0
+        while loop.time() < deadline:
+            async with session.get(
+                f"{self.base_url}/v1/runs/{run_id}",
+                headers=self._headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+            status = data.get("status", "")
+            if status == "done":
+                return data
+            if status == "failed":
+                raise RuntimeError(data.get("error", "AgenticLoop run failed"))
+            await asyncio.sleep(intervals[min(idx, len(intervals) - 1)])
+            idx += 1
+        raise TimeoutError(f"Run {run_id[:8]} timed out after {timeout}s")
+
+    async def healthz(self, session: aiohttp.ClientSession) -> bool:
+        try:
+            async with session.get(
+                f"{self.base_url}/healthz",
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Result extraction (ductile pipeline responses)
+# ---------------------------------------------------------------------------
+
+def extract_result(data: dict) -> str:
+    if "result" in data:
+        result = data["result"]
+        if isinstance(result, str):
+            return result
+        if isinstance(result, dict):
+            direct = result.get("result")
+            if isinstance(direct, str) and direct:
+                return direct
+            for ev in result.get("events", []):
+                if isinstance(ev, dict):
+                    r = ev.get("payload", {}).get("result", "")
+                    if r:
+                        return r
+    return data.get("message", "")
+
+
+# ---------------------------------------------------------------------------
+# Bot
+# ---------------------------------------------------------------------------
+
+class DuctileBot(discord.Client):
     def __init__(self, config):
-        """
-        Initialize the Discord client with configuration.
-
-        Args:
-            config: The bot configuration
-        """
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents)
+
         self.config = config
-        
-        # Initialize prompt cache
-        self.prompt_cache_file = "prompt_cache.json"
-        self.prompt_cache = self.load_prompt_cache()
-        
-        # Setup logging with configuration
+        self.tree = app_commands.CommandTree(self)
+        self.prompt_cache = PromptCache()
+        self.agenticloop = AgenticLoopClient(
+            base_url=os.path.expandvars(config.agenticloop.url),
+            token=os.path.expandvars(config.agenticloop.token),
+        )
+        self._session: aiohttp.ClientSession | None = None
+        self._skills_manifest: str = ""
+        self._skills_fetched_at: float = 0.0
         setup_logging(config)
 
-    async def on_ready(self):
-        """Handle bot ready event by logging successful connection."""
+    async def _fetch_skills_manifest(self) -> str:
+        """Fetch the ductile skills manifest via GET /skills. Cached for 10 minutes."""
+        import time
+        now = time.monotonic()
+        if self._skills_manifest and (now - self._skills_fetched_at) < 600:
+            return self._skills_manifest
+
+        healthz_url = os.path.expandvars(self.config.ductile_llm.healthz_url)
+        base_url = healthz_url.replace("/healthz", "")
+        skills_url = f"{base_url}/skills"
+        try:
+            async with self.session.get(
+                skills_url, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    manifest = await resp.text()
+                    self._skills_manifest = manifest.strip()
+                    self._skills_fetched_at = now
+                    logger.info("Skills manifest refreshed (%d chars)", len(self._skills_manifest))
+                else:
+                    logger.warning("GET /skills returned HTTP %d", resp.status)
+        except Exception as e:
+            logger.warning("Could not fetch skills manifest: %s", e)
+
+        return self._skills_manifest
+
+    async def setup_hook(self) -> None:
+        self._session = aiohttp.ClientSession()
+        guild = discord.Object(id=self.config.server.id)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+        logger.info("Slash commands synced to guild %s", self.config.server.id)
+        # Pre-warm the skills manifest
+        asyncio.create_task(self._fetch_skills_manifest())
+
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+        await super().close()
+
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    def _allowed_channel_ids(self) -> set[int]:
+        return {ch.id for ch in vars(self.config.channels).values()}
+
+    async def on_ready(self) -> None:
+        logger.info("Logged in as %s (id=%s)", self.user.name, self.user.id)
         if not self.config.bot.quiet:
             print(f"✅ Logged in as {self.user.name}")
-        
-        # Send startup announcement to ductile channel
-        ductile_channel_id = self.config.channels.ductile.id
-        channel = self.get_channel(ductile_channel_id)
-        if channel:
-            await channel.send("🤖 Ductile bot is now online and ready to assist!")
 
-    async def on_message(self, message):
-        """
-        Handle incoming messages and respond based on configuration.
+        ductile_ch = getattr(self.config.channels, "ductile", None)
+        if ductile_ch:
+            channel = self.get_channel(ductile_ch.id)
+            if channel:
+                await channel.send("🤖 Ductile bot online. Use `/help` or `@ductile <goal>`.")
 
-        Args:
-            message: The Discord message object
-        """
-        # Avoid responding to self
-        if message.author == self.user:
+    def _bot_was_mentioned(self, message: discord.Message) -> bool:
+        """True if the bot user or any role the bot holds was mentioned."""
+        if self.user.mentioned_in(message):
+            return True
+        if message.guild:
+            bot_member = message.guild.me
+            if bot_member and any(r in message.role_mentions for r in bot_member.roles):
+                return True
+        return False
+
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author == self.user or message.author.bot:
+            return
+        if not self._bot_was_mentioned(message):
+            return
+        if message.channel.id not in self._allowed_channel_ids():
             return
 
-        logger.info("Message from %s", message.author)
+        import re
+        goal = re.sub(r"<@[!&]?\d+>", "", message.content).strip()
+        if not goal:
+            await message.reply("What would you like me to do?")
+            return
 
-        # Identify the channel
-        channel_config = None
-        for chan_name, chan_info in vars(self.config.channels).items():
-            if message.channel.id == chan_info.id:
-                channel_config = chan_info
-                logger.info(f"Found matching channel: {chan_name}")
+        await self._handle_mention(message, goal)
+
+    async def _build_history(self, message: discord.Message, max_messages: int = 20) -> list[dict]:
+        """Walk the Discord reply chain to build conversation history for AgenticLoop."""
+        history = []
+        curr = message
+
+        while curr and len(history) < max_messages:
+            if curr.author == self.user:
+                # Extract text from embeds (our responses are embeds)
+                content = " ".join(
+                    e.description for e in curr.embeds if e.description
+                ) or curr.content
+                role = "assistant"
+            else:
+                content = (
+                    curr.content
+                    .replace(f"<@{self.user.id}>", "")
+                    .replace(f"<@!{self.user.id}>", "")
+                    .strip()
+                )
+                role = "user"
+
+            if content:
+                entry: dict = {"role": role, "content": content}
+                if role == "user":
+                    entry["user"] = curr.author.display_name
+                history.append(entry)
+
+            if curr.reference and curr.reference.message_id:
+                try:
+                    curr = curr.reference.cached_message or await curr.channel.fetch_message(
+                        curr.reference.message_id
+                    )
+                except (discord.NotFound, discord.HTTPException):
+                    break
+            else:
                 break
 
-        if not channel_config:
-            return  # Message not in a configured channel
-        
-        # Handle /help command for any configured channel
-        if message.content.strip() == "/help":
-            help_message = f"**Available commands in this channel:**\n"
+        history.reverse()  # oldest first
+        return history
 
-            for cmd_type, cmd_config in vars(channel_config).items():
-                if cmd_type == "id" or not hasattr(cmd_config, "cmd_prefix"):
-                    continue
+    async def _handle_mention(self, message: discord.Message, goal: str) -> None:
+        # Build conversation history and fetch skills manifest in parallel
+        history, skills_manifest = await asyncio.gather(
+            self._build_history(message),
+            self._fetch_skills_manifest(),
+        )
+        logger.info(
+            "Goal from %s (history=%d): %s",
+            message.author.display_name, len(history), goal[:80],
+        )
 
-                cmd_prefix = cmd_config.cmd_prefix
-                description = getattr(cmd_config, "description", f"{cmd_type} command")
-                help_message += f"• `{cmd_prefix}` - {description}\n"
-
-            help_message += "• `/help` - Show this help message"
-            await message.channel.send(help_message)
-            return
-            
-        # Look through command types for this channel
-        for cmd_type, cmd_config in vars(channel_config).items():
-            # Skip id field and any non-command attributes
-            if cmd_type == "id" or not hasattr(cmd_config, "cmd_prefix"):
-                continue
-                
-            cmd_prefix = cmd_config.cmd_prefix
-            
-            # Check if message starts with this command prefix
-            if message.content.startswith(cmd_prefix):
-                logger.info(f"Command match found: {cmd_type} with prefix {cmd_prefix}")
-                
-                if cmd_type == "rowing" and message.attachments:
-                    # Handle rowing image uploads
-                    image_url = message.attachments[0].url
-                    
-                    # Default to current date if not provided
-                    date = datetime.datetime.now().strftime("%Y-%m-%d")
-                    
-                    # Check message for yyyy-mm-dd dates
-                    if re.search(r"\d{4}-\d{2}-\d{2}", message.content):
-                        date = re.search(r"\d{4}-\d{2}-\d{2}", message.content).group()
-                    
-                    logger.info(f"Processing rowing image with date: {date}")
-                    
-                    # Prepare args
-                    args = {"image_url": image_url, "workout_date": date}
-                    api_url = cmd_config.api_call.url
-                    headers = vars(cmd_config.api_call.headers) if hasattr(cmd_config.api_call, "headers") else {}
-                    
-                    await self.handle_api_call(api_url, args, message.channel, headers)
-                
-                elif cmd_type == "ai":
-                    # Special handling for /ai command with pattern detection and URL support
-                    content = message.content[len(cmd_prefix):].strip()
-                    logger.info(f"Command content: {content}")
-                    await self.handle_ai_command(content, cmd_config, message.channel)
-
-                else:
-                    # Handle text commands
-                    content = message.content[len(cmd_prefix):].strip()
-                    logger.info(f"Command content: {content}")
-
-                    # Get args structure from config and convert to plain dicts
-                    args = self.namespace_to_dict(vars(cmd_config.api_call.args))
-
-                    # Recursively find empty fields in nested structures
-                    def find_empty_fields(obj, path=""):
-                        """Find all empty string fields in nested dict/list structures.
-                        Returns list of (path, parent_dict, key) tuples."""
-                        empty = []
-                        if isinstance(obj, dict):
-                            for key, value in obj.items():
-                                current_path = f"{path}.{key}" if path else key
-                                if value == "":
-                                    empty.append((current_path, obj, key))
-                                elif isinstance(value, (dict, list)):
-                                    empty.extend(find_empty_fields(value, current_path))
-                        elif isinstance(obj, list):
-                            for i, value in enumerate(obj):
-                                current_path = f"{path}[{i}]"
-                                if isinstance(value, (dict, list)):
-                                    empty.extend(find_empty_fields(value, current_path))
-                        return empty
-
-                    empty_fields = find_empty_fields(args)
-                    logger.info(f"Found empty fields: {[path for path, _, _ in empty_fields]}")
-
-                    if len(empty_fields) == 0:
-                        # No empty fields - command doesn't need user input
-                        pass
-                    elif len(empty_fields) == 1:
-                        # Single parameter - populate it with message content
-                        path, parent_dict, key = empty_fields[0]
-                        parent_dict[key] = content
-                        logger.info(f"Populated {path} with message content")
-                    elif cmd_type == "llm":
-                        # Special handling for /llm command with prompt and query_url/query_text
-                        await self.handle_llm_command(content, args, cmd_config, message.channel)
-                        break
-                    else:
-                        # Multi-parameter - parse space-separated values
-                        parts = content.split(' ', len(empty_fields) - 1)  # Split into at most len(empty_fields) parts
-
-                        field_paths = [path for path, _, _ in empty_fields]
-                        if len(parts) != len(empty_fields):
-                            await message.channel.send(f"❌ Expected {len(empty_fields)} parameters: {', '.join(field_paths)}")
-                            break
-
-                        # Assign parts to empty fields in order they appear
-                        for i, (path, parent_dict, key) in enumerate(empty_fields):
-                            parent_dict[key] = parts[i]
-                            logger.info(f"Populated {path} = {parts[i]}")
-
-                        logger.info(f"Multi-parameter command parsed: {args}")
-                    
-                    api_url = cmd_config.api_call.url
-                    headers = vars(cmd_config.api_call.headers) if hasattr(cmd_config.api_call, "headers") else {}
-                    
-                    await self.handle_api_call(api_url, args, message.channel, headers)
-                
-                # We found a matching command, stop checking
-                break
-
-    async def handle_llm_command(self, content, args, cmd_config, channel):
-        """
-        Handle the enhanced /llm command with symbol-based prompt caching.
-        
-        Expected formats:
-        /llm                           # Show cache
-        /llm <url>                     # Use most recent prompt (!) 
-        /llm ! <url>                   # Explicit use of most recent
-        /llm @ "context" <url>         # Use 2nd recent with context
-        /llm "new prompt" <url>        # Create new custom prompt
-        """
-        import shlex
-        
-        # Handle empty command - show cache
-        if not content.strip():
-            cache_display = self.display_cache()
-            await channel.send(cache_display)
-            return
-        
-        try:
-            # Use shlex to properly handle quoted strings
-            parts = shlex.split(content)
-        except ValueError:
-            # If shlex fails (unmatched quotes), fall back to simple split
-            parts = content.split()
-        
-        if len(parts) == 0:
-            # Empty after parsing - show cache
-            cache_display = self.display_cache()
-            await channel.send(cache_display)
-            return
-        
-        # Check if first part is a URL (default to most recent prompt)
-        if len(parts) == 1 and parts[0].startswith(('http://', 'https://')):
-            # /llm <url> - use most recent prompt
-            most_recent = self.resolve_symbol("!")
-            if not most_recent:
-                await channel.send("❌ No cached prompts available. Use: `/llm \"your prompt\" <url>`")
-                return
-            prompt = most_recent
-            query_content = parts[0]
-            context = None
-        
-        # Check if first part is a symbol
-        elif len(parts) >= 2 and parts[0] in "!@#$%^&*()":
-            symbol = parts[0]
-            cached_prompt = self.resolve_symbol(symbol)
-            if not cached_prompt:
-                await channel.send(f"❌ No prompt cached for symbol `{symbol}`. Use `/llm` to see available prompts.")
-                return
-            
-            # Check if we have context and URL
-            if len(parts) == 3:
-                # /llm @ "context" <url>
-                context = parts[1]
-                query_content = parts[2]
-                prompt = self.inject_context(cached_prompt, context)
-            elif len(parts) == 2:
-                # /llm @ <url>
-                context = None
-                query_content = parts[1]
-                prompt = cached_prompt
-            else:
-                await channel.send(f"❌ Invalid format. Use: `/llm {symbol} [context] <url>`")
-                return
-        
-        # Handle traditional format: prompt + content
-        elif len(parts) >= 2:
-            prompt = parts[0]
-            query_content = parts[1]
-            context = None
-            
-            # Store custom prompt if it's not a predefined one and looks like custom text
-            predefined_prompts = [
-                "extract_learning", "analyze_summary", "analyze_extraction", 
-                "analyze_classification", "rowing_extractor"
-            ]
-            
-            # If prompt is quoted or has spaces, it's likely custom
-            if (prompt not in predefined_prompts and 
-                (len(prompt) > 20 or ' ' in prompt or prompt.startswith('"'))):
-                self.store_custom_prompt(prompt)
-        
-        else:
-            await channel.send("❌ Invalid format. Use: `/llm` (show cache), `/llm <url>` (use recent), or `/llm \"prompt\" <url>`")
-            return
-        
-        # Determine if query_content is a URL or text
-        if query_content.startswith(('http://', 'https://')):
-            # It's a URL
-            args["prompt"] = prompt
-            args["query_url"] = query_content
-            # Remove query_text if it exists
-            if "query_text" in args:
-                del args["query_text"]
-        else:
-            # It's text content
-            args["prompt"] = prompt
-            args["query_text"] = query_content
-            # Remove query_url if it exists
-            if "query_url" in args:
-                del args["query_url"]
-        
-        logger.info(f"LLM command parsed - prompt: {prompt}, content: {query_content}, context: {context}")
-        
-        # Make the API call
-        api_url = cmd_config.api_call.url
-        headers = vars(cmd_config.api_call.headers) if hasattr(cmd_config.api_call, "headers") else {}
-        await self.handle_api_call(api_url, args, channel, headers)
-
-    async def handle_ai_command(self, content, cmd_config, channel):
-        """
-        Handle the /ai command with smart parsing.
-
-        Formats:
-        /ai "prompt"                    # One-shot question
-        /ai "prompt" "extra text"       # Question with context (concatenated)
-        /ai "prompt" <url>              # Question with URL context
-        /ai "?pattern prompt"           # Use fabric pattern
-        """
-        import shlex
-
-        if not content.strip():
-            await channel.send("❌ Usage: `/ai \"prompt\"` or `/ai \"prompt\" <url>` or `/ai \"?pattern prompt\"`")
-            return
-
-        try:
-            # Use shlex to handle quoted strings properly
-            parts = shlex.split(content)
-        except ValueError:
-            # If shlex fails, fall back to simple split
-            parts = content.split()
-
-        if len(parts) == 0:
-            await channel.send("❌ Please provide a prompt")
-            return
-
-        # Build payload for fabric
-        payload = {}
-        prompt = parts[0]
-        pattern = None
-
-        # Check if first part is a pattern: ?pattern
-        if prompt.startswith("?"):
-            # Extract pattern
-            if " " in prompt:
-                # Pattern and text in same quoted string: "?analyze some text"
-                pattern_name, prompt_rest = prompt[1:].split(" ", 1)
-                pattern = pattern_name
-                prompt = prompt_rest
-            elif len(parts) > 1:
-                # Pattern as separate word: ?analyze "text" or ?analyze url
-                pattern = prompt[1:]  # Remove the ?
-                prompt = parts[1]  # Use second part as prompt
-                parts = [prompt] + parts[2:]  # Rebuild parts without the pattern
-            else:
-                # Just ?pattern with no text - error
-                await channel.send("❌ Pattern format: `/ai ?pattern \"prompt\"` or `/ai ?pattern url`")
-                return
-
-        # Helper to classify a string as URL type
-        def classify_url(s):
-            if not s.startswith(("http://", "https://")):
-                return None
-            if "youtube.com" in s or "youtu.be" in s:
-                return "youtube"
-            return "url"
-
-        # Check for additional parameters
-        if len(parts) == 1:
-            url_type = classify_url(prompt)
-            if url_type == "youtube":
-                # URL-only: /ai ?pattern <youtube_url>
-                payload["youtube_url"] = prompt
-            elif url_type == "url":
-                # URL-only: /ai ?pattern <url>
-                payload["url"] = prompt
-            else:
-                # One-shot: /ai "prompt"
-                payload["prompt"] = prompt
-            if pattern:
-                payload["pattern"] = pattern
-
-        elif len(parts) == 2:
-            second_param = parts[1]
-            url_type = classify_url(second_param)
-
-            if url_type == "youtube":
-                payload["prompt"] = prompt
-                payload["youtube_url"] = second_param
-            elif url_type == "url":
-                payload["prompt"] = prompt
-                payload["url"] = second_param
-            else:
-                # Text context mode - concatenate
-                payload["prompt"] = f"{prompt}\n\n{second_param}"
-
-            if pattern:
-                payload["pattern"] = pattern
-
-        else:
-            await channel.send("❌ Too many parameters. Usage: `/ai \"prompt\"` or `/ai \"prompt\" <url>`")
-            return
-
-        logger.info(f"AI command parsed - payload: {payload}")
-
-        # Send initial "thinking" message
-        thinking_msg = await channel.send("⏳ Processing your request...")
-
-        # Route to the correct pipeline based on input type
-        base_url = cmd_config.api_call.url.rsplit("/trigger/", 1)[0]
-        if "youtube_url" in payload:
-            api_url = f"{base_url}/trigger/youtube_transcript/handle"
-            # Rename youtube_url to url for the youtube_transcript plugin
-            payload["url"] = payload.pop("youtube_url")
-        elif "url" in payload:
-            api_url = f"{base_url}/trigger/jina-reader/handle"
-        else:
-            api_url = cmd_config.api_call.url  # default: fabric/handle
-
-        headers = vars(cmd_config.api_call.headers) if hasattr(cmd_config.api_call, "headers") else {}
-        args = {"payload": payload}
-        logger.info(f"AI routing to: {api_url}")
-        await self.handle_api_call(api_url, args, channel, headers, status_msg=thinking_msg)
-
-    def namespace_to_dict(self, obj):
-        """Recursively convert SimpleNamespace objects to dictionaries."""
-        if isinstance(obj, SimpleNamespace):
-            return {k: self.namespace_to_dict(v) for k, v in vars(obj).items()}
-        elif isinstance(obj, dict):
-            return {k: self.namespace_to_dict(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [self.namespace_to_dict(item) for item in obj]
-        else:
-            return obj
-
-    async def handle_api_call(self, url, args, channel, headers=None, status_msg=None):
-        """
-        Make an API call and send the formatted response to the Discord channel.
-
-        Args:
-            url: The API endpoint URL
-            args: The arguments to send to the API
-            channel: The Discord channel to send the response to
-            headers: Optional HTTP headers for the request
-            status_msg: Optional message to edit with result (instead of sending new)
-        """
-        try:
-            # Convert args to dictionary (recursively handle nested SimpleNamespace)
-            args = self.namespace_to_dict(args)
-
-            logger.info("Making API call to %s with args: %s", url, args)
-            if headers:
-                logger.info("Using headers: %s", headers)
-                resp = requests.post(url, json=args, headers=headers, timeout=120)
-            else:
-                resp = requests.post(url, json=args, timeout=10)
-
-            resp_json = resp.json()
-
-            with open("api_response.json", "w") as f:
-                yaml.dump(resp_json, f, default_flow_style=False, allow_unicode=True)
-            logger.info("API response saved to api_response.json")
-
-            logger.info("API response: %s", resp_json)
-
-            status = resp_json.get("status", "Error")
-
-            # Check for synchronous response format (has "result" field)
-            if "result" in resp_json and resp_json.get("result"):
-                fabric_output = ""
-
-                # Prefer the top-level terminal result when present, with compatibility
-                # fallback for older event-based response shapes.
-                result = resp_json["result"]
-
-                if isinstance(result, str):
-                    fabric_output = result
-                elif isinstance(result, dict):
-                    direct_result = result.get("result")
-                    if isinstance(direct_result, str) and direct_result:
-                        fabric_output = direct_result
-
-                    if not fabric_output and "events" in result:
-                        for ev in result.get("events", []):
-                            if not isinstance(ev, dict):
-                                continue
-                            payload = ev.get("payload", {})
-                            if not isinstance(payload, dict):
-                                continue
-                            event_result = payload.get("result", "")
-                            if event_result:
-                                fabric_output = event_result
-                                break
-                elif result is not None:
-                    fabric_output = str(result)
-
-                if fabric_output:
-                    reply = f"✅ **{status}**\n\n{fabric_output}"
-                else:
-                    reply = f"**{status}:** Result received but no output"
-            else:
-                # Fallback to old format (message field)
-                message = resp_json.get("message", "No message provided")
-                data = resp_json.get("data")
-
-                reply = f"**{status}:** {message}"
-
-                if data:
-                    formatted_data = "\n".join(f"- **{k}:** {v}" for k, v in data.items())
-                    reply += f"\n{formatted_data}"
-
-            # Edit status message if provided, otherwise send new message
-            if status_msg:
-                await status_msg.edit(content=reply)
-            else:
-                await channel.send(reply)
-
-        except requests.RequestException as request_error:
-            logger.error("Network error calling API: %s", request_error)
-            error_msg = f"❌ Network error calling API: {request_error}"
-            if status_msg:
-                await status_msg.edit(content=error_msg)
-            else:
-                await channel.send(error_msg)
-        except ValueError as value_error:
-            logger.error("Invalid response from API: %s", value_error)
-            error_msg = f"❌ Invalid response from API: {value_error}"
-            if status_msg:
-                await status_msg.edit(content=error_msg)
-            else:
-                await channel.send(error_msg)
-        except (KeyError, TypeError) as data_error:
-            logger.error("Error processing API response: %s", data_error)
-            error_msg = f"❌ Error processing API response: {data_error}"
-            if status_msg:
-                await status_msg.edit(content=error_msg)
-            else:
-                await channel.send(error_msg)
-
-    def load_prompt_cache(self):
-        """Load prompt cache from JSON file."""
-        try:
-            with open(self.prompt_cache_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            # Return default cache structure
-            return {"prompts": []}
-
-    def save_prompt_cache(self):
-        """Save prompt cache to JSON file."""
-        try:
-            with open(self.prompt_cache_file, 'w', encoding='utf-8') as f:
-                json.dump(self.prompt_cache, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error("Error saving prompt cache: %s", e)
-
-    def store_custom_prompt(self, prompt_text):
-        """
-        Store a custom prompt in the cache with symbol assignment.
-        
-        Args:
-            prompt_text: The custom prompt text to store
-        """
-        # Don't store predefined prompts
-        predefined_prompts = [
-            "extract_learning", "analyze_summary", "analyze_extraction", 
-            "analyze_classification", "rowing_extractor"
-        ]
-        if prompt_text in predefined_prompts:
-            return
-
-        # Don't store if it's already the most recent
-        if (self.prompt_cache["prompts"] and 
-            self.prompt_cache["prompts"][0]["text"] == prompt_text):
-            return
-
-        # Remove existing instance if it exists
-        self.prompt_cache["prompts"] = [
-            p for p in self.prompt_cache["prompts"] if p["text"] != prompt_text
-        ]
-
-        # Add new prompt at the beginning
-        new_prompt = {
-            "text": prompt_text,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "usage_count": 1
+        context: dict = {
+            "session_id": str(message.channel.id),
+            "source": "discord",
+            "user": message.author.display_name,
+            "history": history,
         }
-        self.prompt_cache["prompts"].insert(0, new_prompt)
+        if skills_manifest:
+            context["available_tools_manifest"] = skills_manifest
 
-        # Keep only last 10 prompts
-        self.prompt_cache["prompts"] = self.prompt_cache["prompts"][:10]
+        # Submit to AgenticLoop
+        try:
+            wake_resp = await self.agenticloop.wake(
+                self.session,
+                goal=goal,
+                wake_id=str(message.id),
+                context=context,
+            )
+        except Exception as e:
+            logger.error("Failed to submit to AgenticLoop: %s", e)
+            await message.reply(f"❌ Failed to reach AgenticLoop: {e}")
+            return
 
-        # Assign symbols
-        symbols = "!@#$%^&*()"
-        for i, prompt in enumerate(self.prompt_cache["prompts"]):
-            if i < len(symbols):
-                prompt["symbol"] = symbols[i]
+        run_id = wake_resp["run_id"]
+        logger.info("AgenticLoop run started: %s", run_id)
 
-        # Save to file
-        self.save_prompt_cache()
+        # Post placeholder reply (so user has something to reply to for follow-ups)
+        placeholder = await message.reply(f"⏳ `{run_id[:8]}…`")
 
-    def resolve_symbol(self, symbol):
-        """
-        Resolve a symbol to prompt text.
-        
-        Args:
-            symbol: The symbol to resolve (!, @, #, etc.)
-            
-        Returns:
-            The prompt text or None if symbol not found
-        """
-        for prompt in self.prompt_cache["prompts"]:
-            if prompt.get("symbol") == symbol:
-                # Update usage count and timestamp
-                prompt["usage_count"] += 1
-                prompt["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                self.save_prompt_cache()
-                return prompt["text"]
-        return None
+        try:
+            t0 = asyncio.get_event_loop().time()
 
-    def display_cache(self):
-        """
-        Format the prompt cache for Discord display.
-        
-        Returns:
-            Formatted string for Discord message
-        """
-        if not self.prompt_cache["prompts"]:
-            return "**Recent Custom Prompts:** None cached yet."
+            # channel.typing() keeps the indicator alive for the whole poll duration
+            async with message.channel.typing():
+                result = await self.agenticloop.poll_until_done(self.session, run_id)
 
-        lines = ["**Recent Custom Prompts:**"]
-        for prompt in self.prompt_cache["prompts"]:
-            symbol = prompt.get("symbol", "?")
-            text = prompt["text"]
-            # Truncate long prompts
-            if len(text) > 50:
-                text = text[:47] + "..."
-            
-            # Format timestamp
-            try:
-                timestamp = datetime.datetime.fromisoformat(prompt["timestamp"].replace('Z', '+00:00'))
-                time_ago = self.format_time_ago(timestamp)
-            except:
-                time_ago = "unknown"
-            
-            lines.append(f"{symbol} \"{text}\" ({time_ago})")
+            elapsed = int(asyncio.get_event_loop().time() - t0)
+            summary = result.get("summary") or result.get("result") or "Done (no summary)"
 
-        return "\n".join(lines)
+            embed = discord.Embed(
+                description=summary[:4096],
+                color=discord.Color.dark_green(),
+            )
+            embed.set_footer(text=f"{run_id[:8]} · {elapsed}s")
 
-    def format_time_ago(self, timestamp):
-        """Format timestamp as 'X hours ago' etc."""
-        now = datetime.datetime.now(datetime.timezone.utc)
-        diff = now - timestamp
-        
-        if diff.days > 0:
-            return f"{diff.days} day{'s' if diff.days != 1 else ''} ago"
-        elif diff.seconds > 3600:
-            hours = diff.seconds // 3600
-            return f"{hours} hour{'s' if hours != 1 else ''} ago"
-        elif diff.seconds > 60:
-            minutes = diff.seconds // 60
-            return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+            if len(summary) > 4096:
+                await placeholder.edit(
+                    content=None,
+                    embed=embed,
+                    attachments=[discord.File(fp=io.BytesIO(summary.encode()), filename="result.md")],
+                )
+            else:
+                await placeholder.edit(content=None, embed=embed)
+
+        except TimeoutError as e:
+            await placeholder.edit(content=f"⏱️ {e}")
+        except Exception as e:
+            logger.error("AgenticLoop error for run %s: %s", run_id[:8], e)
+            await placeholder.edit(content=f"❌ {e}")
+
+
+# ---------------------------------------------------------------------------
+# Slash commands
+# ---------------------------------------------------------------------------
+
+def register_commands(bot: DuctileBot) -> None:
+
+    @bot.tree.command(name="llm", description="Ask the LLM with optional URL")
+    @app_commands.describe(
+        prompt="Prompt text, cache symbol (!@#$%), or 'text|!' to save to cache slot",
+        url="Optional URL to process",
+    )
+    async def cmd_llm(interaction: discord.Interaction, prompt: str, url: str = "") -> None:
+        await interaction.response.defer(thinking=True)
+
+        cache = bot.prompt_cache
+        cfg = bot.config.ductile_llm
+
+        # Resolve what the prompt actually is
+        if len(prompt) == 1 and prompt in SYMBOLS:
+            actual_prompt = cache.resolve(prompt)
+            if not actual_prompt:
+                await interaction.followup.send(
+                    f"❌ Nothing cached at `{prompt}`. Use `/help` to see the cache."
+                )
+                return
+        elif "|" in prompt:
+            text, symbol = prompt.split("|", 1)
+            actual_prompt = text.strip()
+            symbol = symbol.strip()
+            if actual_prompt:
+                assigned = cache.store(actual_prompt)
+                logger.info("Cached prompt as '%s': %s", assigned, actual_prompt[:40])
         else:
-            return "just now"
+            actual_prompt = prompt.strip()
+            if actual_prompt:
+                cache.store(actual_prompt)
 
-    def inject_context(self, prompt, context):
-        """
-        Inject context into a prompt.
-        
-        Args:
-            prompt: The base prompt text
-            context: The context to inject
-            
-        Returns:
-            The prompt with context injected
-        """
-        return f"{prompt} in the context of {context}"
+        payload: dict = {"prompt": actual_prompt}
+        if url:
+            payload["url"] = url.strip()
+
+        api_url = os.path.expandvars(cfg.url)
+        token = os.path.expandvars(cfg.token)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+
+        try:
+            async with bot.session.post(
+                api_url,
+                json={"payload": payload},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                data = await resp.json()
+
+            result = extract_result(data)
+            if not result:
+                await interaction.followup.send("✅ Done (no output)")
+                return
+
+            embed = discord.Embed(
+                description=result[:4096],
+                color=discord.Color.dark_green(),
+            )
+            if len(result) > 4096:
+                await interaction.followup.send(
+                    embed=embed,
+                    file=discord.File(fp=io.BytesIO(result.encode()), filename="result.md"),
+                )
+            else:
+                await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            logger.error("LLM command error: %s", e)
+            await interaction.followup.send(f"❌ Error: {e}")
+
+    @bot.tree.command(name="status", description="Check ductile and AgenticLoop health")
+    async def cmd_status(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True)
+        lines = []
+
+        cfg = bot.config.ductile_llm
+        healthz_url = os.path.expandvars(cfg.healthz_url)
+        try:
+            async with bot.session.get(
+                healthz_url, timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                ok = resp.status == 200
+        except Exception:
+            ok = False
+        lines.append(f"{'✅' if ok else '❌'} ductile-local (`{healthz_url}`)")
+
+        al_ok = await bot.agenticloop.healthz(bot.session)
+        al_url = os.path.expandvars(bot.config.agenticloop.url)
+        lines.append(f"{'✅' if al_ok else '❌'} AgenticLoop (`{al_url}`)")
+
+        await interaction.followup.send("\n".join(lines))
+
+    @bot.tree.command(name="help", description="Show commands and prompt cache")
+    async def cmd_help(interaction: discord.Interaction) -> None:
+        cache_display = bot.prompt_cache.format_for_discord()
+        text = (
+            "**Commands:**\n"
+            "`/llm prompt:<text> [url:<url>]` — Ask the LLM via ductile fabric\n"
+            "  • Use `!@#$%` as prompt to recall a cached entry\n"
+            "  • Append `|!` to save to a slot: `summarise this|!`\n"
+            "`/status` — Check ductile + AgenticLoop health\n"
+            "`/help` — This message (ephemeral)\n"
+            "`@ductile <goal>` — Free-form goal → AgenticLoop (creates a thread)\n"
+            "\n"
+        ) + cache_display
+        await interaction.response.send_message(text, ephemeral=True)
 
 
-# --- CLI Setup with Click ---
-
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 @click.group()
 @click.option("--config", default="config.yaml", help="Path to YAML config file.")
-@click.option(
-    "--quiet", is_flag=True, default=False, help="Suppress non-critical output."
-)
+@click.option("--quiet", is_flag=True, default=False)
 @click.pass_context
 def cli(ctx, config, quiet):
-    """Ductile Discord bot CLI interface."""
+    """Ductile Discord bot."""
+    load_dotenv(config)
     cfg = Config.load(config)
     if quiet:
         cfg.bot.quiet = quiet
@@ -749,49 +608,31 @@ def cli(ctx, config, quiet):
 @cli.command()
 @click.pass_context
 def start(ctx):
-    """Start the Discord bot."""
+    """Start the bot."""
     cfg = ctx.obj["cfg"]
-    client = DuctileDiscordClient(cfg)
-    client.run(cfg.bot.token)
+    bot = DuctileBot(cfg)
+    register_commands(bot)
+    bot.run(os.path.expandvars(cfg.bot.token))
 
 
 @cli.command()
 @click.pass_context
 def check(ctx):
-    """Check if API endpoints are accessible."""
+    """Check API endpoint health (sync)."""
+    import requests as req
+
     cfg = ctx.obj["cfg"]
-    click.echo("🔍 Checking API endpoints...")
-
-    endpoints = []
-
-    # Scan for endpoints in the new nested structure
-    for chan_name, chan_info in vars(cfg.channels).items():
-        for cmd_type, cmd_config in vars(chan_info).items():
-            if cmd_type == "id":
-                continue
-            
-            if hasattr(cmd_config, "api_call") and hasattr(cmd_config.api_call, "url"):
-                endpoint_name = f"Channel '{chan_name}' - {cmd_type}"
-                endpoint_url = cmd_config.api_call.url
-                endpoints.append((endpoint_name, endpoint_url))
-
-    for name, url in endpoints:
+    pairs = [
+        ("ductile-local", os.path.expandvars(cfg.ductile_llm.healthz_url)),
+        ("agenticloop", os.path.expandvars(cfg.agenticloop.url).rstrip("/") + "/healthz"),
+    ]
+    for name, url in pairs:
         try:
-            # Try a GET request first to check if endpoint exists
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                click.echo(f"✅ {name}: OK")
-            else:
-                click.echo(f"⚠️ {name}: HTTP {resp.status_code}")
-        except requests.ConnectionError:
-            click.echo(f"❌ {name}: Connection error")
-        except requests.Timeout:
-            click.echo(f"❌ {name}: Timeout error")
-        except requests.RequestException as error:
-            click.echo(f"❌ {name}: Request error ({error})")
+            r = req.get(url, timeout=5)
+            click.echo(f"{'✅' if r.status_code == 200 else '⚠️'} {name}: HTTP {r.status_code}")
+        except Exception as e:
+            click.echo(f"❌ {name}: {e}")
 
-
-# --- Main Entrypoint ---
 
 if __name__ == "__main__":
-    cli()  # pylint: disable=no-value-for-parameter
+    cli()
