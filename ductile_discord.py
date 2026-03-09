@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import re
 from types import SimpleNamespace
 
 import aiohttp
@@ -242,14 +243,15 @@ def extract_result(data: dict) -> str:
         if isinstance(result, str):
             return result
         if isinstance(result, dict):
-            direct = result.get("result")
-            if isinstance(direct, str) and direct:
-                return direct
+            # Prefer event payload result (actual content) over the log string
             for ev in result.get("events", []):
                 if isinstance(ev, dict):
                     r = ev.get("payload", {}).get("result", "")
                     if r:
                         return r
+            direct = result.get("result")
+            if isinstance(direct, str) and direct:
+                return direct
     return data.get("message", "")
 
 
@@ -478,18 +480,23 @@ class DuctileBot(discord.Client):
 
 def register_commands(bot: DuctileBot) -> None:
 
-    @bot.tree.command(name="llm", description="Ask the LLM with optional URL")
+    @bot.tree.command(name="llm", description="Ask the LLM. Include a URL anywhere in your message and it will be detected automatically.")
     @app_commands.describe(
-        prompt="Prompt text, cache symbol (!@#$%), or 'text|!' to save to cache slot",
-        url="Optional URL to process",
+        input="Your prompt, optionally containing a URL. Cache shortcuts: single symbol (!@#$%) to recall, 'text|!' to save.",
     )
-    async def cmd_llm(interaction: discord.Interaction, prompt: str, url: str = "") -> None:
+    async def cmd_llm(interaction: discord.Interaction, input: str) -> None:
         await interaction.response.defer(thinking=True)
 
         cache = bot.prompt_cache
         cfg = bot.config.ductile_llm
 
-        # Resolve what the prompt actually is
+        # Extract URL from input
+        url_pattern = re.compile(r'https?://\S+')
+        url_match = url_pattern.search(input)
+        url = url_match.group(0).rstrip(".,)>") if url_match else ""
+        prompt = url_pattern.sub("", input).strip() if url_match else input.strip()
+
+        # Resolve cache shortcuts
         if len(prompt) == 1 and prompt in SYMBOLS:
             actual_prompt = cache.resolve(prompt)
             if not actual_prompt:
@@ -505,13 +512,13 @@ def register_commands(bot: DuctileBot) -> None:
                 assigned = cache.store(actual_prompt)
                 logger.info("Cached prompt as '%s': %s", assigned, actual_prompt[:40])
         else:
-            actual_prompt = prompt.strip()
+            actual_prompt = prompt
             if actual_prompt:
                 cache.store(actual_prompt)
 
         payload: dict = {"prompt": actual_prompt}
         if url:
-            payload["url"] = url.strip()
+            payload["url"] = url
 
         api_url = os.path.expandvars(cfg.url)
         token = os.path.expandvars(cfg.token)
