@@ -59,5 +59,38 @@ uv run ductile-discord check
 
 See `CLAUDE.md` for detailed configuration instructions and architecture overview.
 
+## Utilities
+
+### `read_messages.py` — Channel message reader
+
+A CLI tool for reading recent messages from a Discord channel. Useful for validating that `discord_notify` webhook deliveries actually landed, without opening the Discord client.
+
+```bash
+# Last 10 messages from the default channel (ductile-test)
+uv run python read_messages.py
+
+# Check the ductile channel
+uv run python read_messages.py --channel ductile
+
+# More messages, or use a raw channel ID
+uv run python read_messages.py --limit 20
+uv run python read_messages.py --channel 1471755413828538450
+
+# Custom config path
+uv run python read_messages.py --config /path/to/config.yaml
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--channel`, `-c` | `ductile-test` | Channel name (from config) or raw channel ID |
+| `--limit`, `-n` | `10` | Number of messages to fetch |
+| `--config` | `~/.config/ductile-discord/config.yaml` | Path to bot config |
+
+Output includes timestamp, author (with `[bot]` tag), message text, and embed content. Messages are shown newest-first.
+
+The script uses the bot token from `config.yaml` and resolves channel names from the `channels:` block, so any channel defined there can be referenced by name.
+
 ## Changelog
 See [CHANGELOG.md](CHANGELOG.md).
